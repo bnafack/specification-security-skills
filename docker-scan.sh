@@ -5,7 +5,7 @@
 # Specification: DockerSecuritySpec.md
 #
 # Usage:
-#   ./docker-scan.sh --setup <A|B|C|D> (--image <image:tag>... | --images-file <file> | --all) [OPTIONS]
+#   ./docker-scan.sh --setup <A|B|C|D> (--image <image:tag>... | --images-file <file> | --all | --semgrep <path>) [OPTIONS]
 #
 # Options:
 #   --setup       <A|B|C|D>        Required. Deployment setup type
@@ -32,8 +32,26 @@
 #   --region      <aws-region>     Required for Setup C and D
 #   --repo        <ecr-repo-name>  Required for Setup C and D (single image only)
 #   --profile     <aws-profile>    Optional. AWS CLI named profile
+#   --semgrep     <path>           Run Semgrep (open-source SAST) on a source directory or file
+#                                  (repeatable). Works alone, without any image. Run it BEFORE
+#                                  docker build: it finds flaws in your own code, Trivy finds
+#                                  them in dependencies/OS packages. Uses the 'semgrep' CLI, or
+#                                  the semgrep/semgrep Docker image (mounted read-only) if the
+#                                  CLI is missing. Writes <report-dir>/semgrep/<path>.json/.txt
+#                                  and a "semgrep" section in summary.json/summary.md plus
+#                                  semgrep-summary.csv. Honours .semgrepignore in the scanned path;
+#                                  node_modules, .git, venv, .venv, dist, build, __pycache__ and
+#                                  vendor are always excluded. Always runs with --metrics off
+#   --semgrep-config <cfg>         Semgrep rules (repeatable, default: auto). Examples: p/owasp-top-ten,
+#                                  p/python, p/docker, p/dockerfile, or a local rules file/directory.
+#                                  'auto' fetches rules from the Semgrep registry (needs network);
+#                                  local rule files work offline
+#   --semgrep-severity <ERROR|WARNING|INFO>
+#                                  Minimum severity to report and to fail on with --exit-on-fail
+#                                  (default: report INFO and above, fail on ERROR)
 #
-# Exit codes: 0 ok, 1 findings (only with --exit-on-fail), 2 a scan/tool error
+# Exit codes: 0 ok, 1 findings (only with --exit-on-fail; includes Semgrep findings at/above the
+#             gate severity), 2 a scan/tool error (including Semgrep missing or failing)
 #
 # Examples:
 #   ./docker-scan.sh --setup A --image myapp:1.0.0
@@ -104,7 +122,27 @@
 #   # 14. List fixable CRITICAL/HIGH findings of one image with jq (package, installed -> fixed)
 #   jq -r '.Results[]?.Vulnerabilities[]? | select(.Severity=="CRITICAL" or .Severity=="HIGH") | select(.FixedVersion!=null) | "\(.Severity) \(.PkgName) \(.InstalledVersion) -> \(.FixedVersion)"' report/images/postgres_16.json | sort -u
 #
-#   # 15. Show this help
+#   # 15. Semgrep only: static analysis of your source code (no image needed)
+#   ./docker-scan.sh --setup A --semgrep ./src
+#
+#   # 16. Semgrep with rule packs (registry rules need network; --metrics off is always set)
+#   ./docker-scan.sh --setup A --semgrep ./src --semgrep-config p/owasp-top-ten --semgrep-config p/python
+#
+#   # 17. Dockerfile / compose focused rules on the whole project
+#   ./docker-scan.sh --setup A --semgrep . --semgrep-config p/dockerfile
+#
+#   # 18. Semgrep + image scan with an exit gate (exit 1 on ERROR findings, CRITICAL/HIGH CVEs...)
+#   ./docker-scan.sh --setup B --semgrep ./src --image myapp:1.0.0 --exit-on-fail
+#
+#   # 19. Recommended pipeline order: semgrep -> docker build -> trivy/image checks -> runtime checks
+#   ./docker-scan.sh --setup B --semgrep ./src --exit-on-fail       # 1. SAST on the source
+#   docker build -t myapp:1.0.0 .                                   # 2. build
+#   ./docker-scan.sh --setup B --image myapp:1.0.0 --exit-on-fail   # 3. Trivy + image checks
+#   docker run -d --name myapp myapp:1.0.0                          # 4. start, then re-run step 3
+#                                                                   #    for the runtime checks
+#   # Suppress a false positive in code: add "# nosemgrep: <rule-id>" and a comment why
+#
+#   # 20. Show this help
 #   ./docker-scan.sh --help
 # =============================================================================
 
@@ -135,6 +173,9 @@ FORCE=false
 SKIP_DB_UPDATE=false
 SCAN_SECRETS=false
 EXIT_ON_FAIL=false
+SEMGREP_PATHS=()
+SEMGREP_CONFIGS=()
+SEMGREP_SEVERITY=""
 REMEDIATION=true
 AWS_REGION=""
 ECR_REPO=""
@@ -170,6 +211,9 @@ while [[ $# -gt 0 ]]; do
     --region)         need_arg "$@"; AWS_REGION="$2";   shift 2 ;;
     --repo)           need_arg "$@"; ECR_REPO="$2";     shift 2 ;;
     --profile)        need_arg "$@"; AWS_PROFILE="$2";  shift 2 ;;
+    --semgrep)        need_arg "$@"; SEMGREP_PATHS+=("$2");   shift 2 ;;
+    --semgrep-config) need_arg "$@"; SEMGREP_CONFIGS+=("$2"); shift 2 ;;
+    --semgrep-severity) need_arg "$@"; SEMGREP_SEVERITY="${2^^}"; shift 2 ;;
     -h|--help)        sed -n '2,/^set -E/{/^set -E/!p}' "$0"; exit 0 ;;
     *) die "Unknown argument: $1" ;;
   esac
@@ -196,14 +240,31 @@ if [[ "$SCAN_ALL" == true ]]; then
   done < <(docker images --format '{{.Repository}}:{{.Tag}}')
 fi
 
-[[ ${#IMAGES[@]} -gt 0 ]] || die "No image given: use --image, --images-file or --all"
+[[ ${#IMAGES[@]} -gt 0 || ${#SEMGREP_PATHS[@]} -gt 0 ]] \
+  || die "Nothing to scan: use --image, --images-file, --all or --semgrep <path>"
 
-# De-duplicate while preserving order
-mapfile -t IMAGES < <(printf '%s\n' "${IMAGES[@]}" | awk '!seen[$0]++')
+HAVE_IMAGES=false
+if [[ ${#IMAGES[@]} -gt 0 ]]; then
+  HAVE_IMAGES=true
+  # De-duplicate while preserving order
+  mapfile -t IMAGES < <(printf '%s\n' "${IMAGES[@]}" | awk '!seen[$0]++')
 
-if [[ "$SETUP" == "C" || "$SETUP" == "D" ]]; then
-  [[ -n "$AWS_REGION" && -n "$ECR_REPO" ]] || die "--region and --repo are required for Setup $SETUP"
-  [[ ${#IMAGES[@]} -eq 1 ]] || die "Setup $SETUP ECR checks support exactly one image"
+  if [[ "$SETUP" == "C" || "$SETUP" == "D" ]]; then
+    [[ -n "$AWS_REGION" && -n "$ECR_REPO" ]] || die "--region and --repo are required for Setup $SETUP"
+    [[ ${#IMAGES[@]} -eq 1 ]] || die "Setup $SETUP ECR checks support exactly one image"
+  fi
+fi
+
+if [[ ${#SEMGREP_PATHS[@]} -gt 0 ]]; then
+  [[ -z "$SEMGREP_SEVERITY" || "$SEMGREP_SEVERITY" =~ ^(ERROR|WARNING|INFO)$ ]] \
+    || die "--semgrep-severity must be ERROR, WARNING or INFO (got '$SEMGREP_SEVERITY')"
+  for p in "${SEMGREP_PATHS[@]}"; do
+    [[ -e "$p" ]] || die "Semgrep path not found: $p"
+  done
+  mapfile -t SEMGREP_PATHS < <(printf '%s\n' "${SEMGREP_PATHS[@]}" | awk '!seen[$0]++')
+  [[ ${#SEMGREP_CONFIGS[@]} -gt 0 ]] || SEMGREP_CONFIGS=(auto)
+elif [[ ${#SEMGREP_CONFIGS[@]} -gt 0 || -n "$SEMGREP_SEVERITY" ]]; then
+  die "--semgrep-config and --semgrep-severity need --semgrep <path>"
 fi
 
 if [[ -z "$JOBS" ]]; then
@@ -219,11 +280,28 @@ check_dependency() {
   command -v "$1" &>/dev/null || die "'$1' is not installed or not in PATH"
 }
 
-check_dependency docker
 check_dependency jq
-docker info &>/dev/null || die "Cannot talk to the Docker daemon (is it running? permissions?)"
-[[ "$SETUP" == "C" ]] || check_dependency trivy
-[[ "$SETUP" == "C" || "$SETUP" == "D" ]] && check_dependency aws
+if [[ "$HAVE_IMAGES" == true ]]; then
+  check_dependency docker
+  docker info &>/dev/null || die "Cannot talk to the Docker daemon (is it running? permissions?)"
+  [[ "$SETUP" == "C" ]] || check_dependency trivy
+  if [[ "$SETUP" == "C" || "$SETUP" == "D" ]]; then check_dependency aws; fi
+fi
+
+# Semgrep engine: local CLI first, else the semgrep/semgrep Docker image (path mounted read-only)
+SEMGREP_ENGINE=""
+SEMGREP_IMAGE="semgrep/semgrep"
+if [[ ${#SEMGREP_PATHS[@]} -gt 0 ]]; then
+  if command -v semgrep &>/dev/null; then
+    SEMGREP_ENGINE="cli"
+  elif command -v docker &>/dev/null && docker info &>/dev/null; then
+    SEMGREP_ENGINE="docker"
+  else
+    die "'semgrep' is not installed and Docker is not available as a fallback.
+  Install it with:  pipx install semgrep   (or: pip install semgrep)
+  Or run it with Docker:  docker run --rm -v \"\$PWD:/src\" semgrep/semgrep semgrep scan --config auto /src"
+  fi
+fi
 
 # -----------------------------------------------------------------------------
 # Report directory and output helpers
@@ -262,6 +340,7 @@ log "Report dir: $REPORT_DIR"
 [[ -n "$COMPOSE_FILE" ]] && log "Compose:    $COMPOSE_FILE"
 [[ -n "$OUTPUT_FILE"  ]] && log "Output:     $OUTPUT_FILE"
 [[ -n "$AWS_PROFILE"  ]] && log "Profile:    $AWS_PROFILE"
+[[ ${#SEMGREP_PATHS[@]} -gt 0 ]] && log "Semgrep:    ${SEMGREP_PATHS[*]} (engine: $SEMGREP_ENGINE)"
 
 SECRET_PATTERNS='PASSWORD|SECRET|TOKEN|KEY|CREDENTIAL|PRIVATE'
 
@@ -279,6 +358,123 @@ filter_secret_env() {
   done
 }
 safe_name() { printf '%s' "${1//[^A-Za-z0-9._-]/_}"; }
+
+# =============================================================================
+# SECTION 0 — SEMGREP STATIC ANALYSIS (source code, before the image is built)
+# Finds flaws in your own code; Trivy (section 4) covers dependencies/OS packages.
+# semgrep exits 0 on findings unless --error is passed, so rc 0/1 = scan done,
+# anything else (or an unreadable JSON) = tool failure (exit 2).
+# =============================================================================
+SG_DIR="$REPORT_DIR/semgrep"
+SG_ITEMS="$REPORT_DIR/.semgrep.jsonl"
+: > "$SG_ITEMS"
+SG_GATE_SEV="${SEMGREP_SEVERITY:-ERROR}"
+SG_FINDINGS=0
+SG_EXCLUDES=(node_modules .git venv .venv dist build __pycache__ vendor)
+
+# jq: one summary object from a Semgrep JSON report (findings sorted by severity)
+SG_JQ='
+def sev: (.extra.severity // "INFO" | ascii_upcase
+          | if . == "CRITICAL" or . == "HIGH" then "ERROR" elif . == "MEDIUM" then "WARNING"
+            elif . == "ERROR" or . == "WARNING" or . == "INFO" then . else "INFO" end);
+def rank: {"ERROR": 3, "WARNING": 2, "INFO": 1}[.];
+. as $d | [$d.results[]? | { severity: sev, check_id: .check_id, rule: (.check_id | split(".") | last),
+    file: (.path | ltrimstr("/src/")), line: .start.line,
+    message: ((.extra.message // "") | gsub("\\s+"; " ") | if length > 120 then .[:117] + "..." else . end) }]
+| sort_by([-(.severity | rank), .file, .line]) as $f
+| { path: $path, engine: $engine, configs: $configs, report: $report,
+    files_scanned: (($d.paths.scanned // []) | length),
+    scan_errors: [$d.errors[]? | ((.level // "error") + ": " + ((.message // .long_msg // "unknown error") | gsub("\\s+"; " ") | .[:200]))],
+    counts: { error: ([$f[] | select(.severity == "ERROR")] | length),
+              warning: ([$f[] | select(.severity == "WARNING")] | length),
+              info: ([$f[] | select(.severity == "INFO")] | length) },
+    gate_severity: $gate,
+    gate_findings: ([$f[] | select((.severity | rank) >= ($gate | rank))] | length),
+    status: "OK", findings: $f }'
+
+# render_semgrep <summary-json> <max-per-severity-or-0-for-all>: findings grouped by severity
+render_semgrep() {
+  jq -r --argjson max "$2" '
+    . as $s
+    | "  \(.path): \(.findings|length) finding(s)  ERROR=\(.counts.error) WARNING=\(.counts.warning) INFO=\(.counts.info)  files scanned=\(.files_scanned)",
+      ( ["ERROR","WARNING","INFO"][] as $sev
+        | [$s.findings[] | select(.severity == $sev)] as $g
+        | select(($g|length) > 0)
+        | "    \($sev) (\($g|length))",
+          (if $max > 0 then $g[:$max] else $g end | .[] | "      \(.rule)  \(.file):\(.line)  \(.message)"),
+          (if $max > 0 and ($g|length) > $max then "      ... \(($g|length) - $max) more (see the JSON/TXT report)" else empty end) )' <<<"$1"
+}
+
+# run_semgrep <path>: scans one path, appends a summary object to $SG_ITEMS
+run_semgrep() {
+  local path="$1" abs safe out err rc=0 dir target item cfg n=0 summary_cfgs
+  abs=$(realpath "$path"); safe=$(safe_name "$abs")
+  out="$SG_DIR/$safe.json"; err="$SG_DIR/$safe.err"
+  log_info "Semgrep: $path (rules: ${SEMGREP_CONFIGS[*]})"
+  [[ -f "$abs/.semgrepignore" || -f "$(dirname "$abs")/.semgrepignore" ]] && log_info "Using .semgrepignore"
+
+  local sev_args=() exc_args=() cfg_args=() mounts=()
+  [[ -n "$SEMGREP_SEVERITY" ]] && sev_args=(--severity "$SEMGREP_SEVERITY")
+  for e in "${SG_EXCLUDES[@]}"; do exc_args+=(--exclude "$e"); done
+
+  if [[ "$SEMGREP_ENGINE" == "cli" ]]; then
+    for cfg in "${SEMGREP_CONFIGS[@]}"; do cfg_args+=(--config "$cfg"); done
+    semgrep scan "${cfg_args[@]}" --json --output "$out.tmp" --metrics off --quiet \
+      --disable-version-check "${sev_args[@]}" "${exc_args[@]}" "$path" >/dev/null 2>"$err" || rc=$?
+  else
+    log_warn "semgrep CLI not found: running Semgrep through Docker ($SEMGREP_IMAGE, path mounted read-only)"
+    if [[ -d "$abs" ]]; then dir="$abs"; target="/src"; else dir="$(dirname "$abs")"; target="/src/$(basename "$abs")"; fi
+    mounts=(-v "$dir:/src:ro")
+    for cfg in "${SEMGREP_CONFIGS[@]}"; do
+      if [[ -e "$cfg" ]]; then
+        n=$((n + 1)); mounts+=(-v "$(realpath "$cfg"):/cfg/$n:ro"); cfg_args+=(--config "/cfg/$n")
+      else
+        cfg_args+=(--config "$cfg")
+      fi
+    done
+    docker run --rm "${mounts[@]}" "$SEMGREP_IMAGE" semgrep scan "${cfg_args[@]}" --json --metrics off \
+      --quiet --disable-version-check "${sev_args[@]}" "${exc_args[@]}" "$target" >"$out.tmp" 2>"$err" || rc=$?
+  fi
+
+  if (( rc > 1 )) || ! jq -e '.results' "$out.tmp" >/dev/null 2>&1; then
+    rm -f "$out.tmp"
+    log_fail "Semgrep failed on $path (exit $rc) — see $err"
+    tail -5 "$err" | while IFS= read -r l; do log "         $l"; done
+    SCAN_ERRORS=$((SCAN_ERRORS + 1))
+    jq -n --arg path "$path" --arg engine "$SEMGREP_ENGINE" --arg gate "$SG_GATE_SEV" \
+      '{ path: $path, engine: $engine, status: "TOOL_ERROR", gate_severity: $gate, gate_findings: 0,
+         counts: {error: 0, warning: 0, info: 0}, files_scanned: 0, scan_errors: [], findings: [] }' >> "$SG_ITEMS"
+    return 0
+  fi
+  mv "$out.tmp" "$out"
+
+  summary_cfgs=$(printf '%s\n' "${SEMGREP_CONFIGS[@]}" | jq -R . | jq -s .)
+  item=$(jq -c --arg path "$path" --arg engine "$SEMGREP_ENGINE" --arg gate "$SG_GATE_SEV" \
+          --arg report "$out" --argjson configs "$summary_cfgs" "$SG_JQ" "$out")
+  printf '%s\n' "$item" >> "$SG_ITEMS"
+  render_semgrep "$item" 0 > "$SG_DIR/$safe.txt"
+
+  while IFS= read -r l; do log "$l"; done < <(render_semgrep "$item" 20)
+  while IFS= read -r l; do log_warn "Semgrep scan error: $l"; done < <(jq -r '.scan_errors[:5][]' <<<"$item")
+  local gate_n total
+  gate_n=$(jq -r '.gate_findings' <<<"$item"); total=$(jq -r '.findings | length' <<<"$item")
+  SG_FINDINGS=$((SG_FINDINGS + total))
+  if (( gate_n > 0 )); then
+    log_fail "Semgrep: $gate_n finding(s) at severity $SG_GATE_SEV or above in $path"
+  else
+    log_pass "Semgrep: no finding at severity $SG_GATE_SEV or above in $path"
+  fi
+  log_info "Semgrep reports: $out and $SG_DIR/$safe.txt"
+}
+
+if [[ ${#SEMGREP_PATHS[@]} -gt 0 ]]; then
+  log_section "Semgrep Static Analysis (SAST)"
+  mkdir -p "$SG_DIR"
+  if [[ " ${SEMGREP_CONFIGS[*]} " == *" auto "* ]]; then
+    log_info "--config auto fetches rules from the Semgrep registry (network needed); local rule files work offline"
+  fi
+  for sp in "${SEMGREP_PATHS[@]}"; do run_semgrep "$sp"; done
+fi
 
 # =============================================================================
 # SECTION 1/2 — IMAGE INSPECT + RUNNING CONTAINER INSPECT (all setups)
@@ -375,9 +571,11 @@ check_image_config() {
   IMG_CFG_FAILS[$img]=$CFG_FAILS
 }
 
-for img in "${IMAGES[@]}"; do
-  check_image_config "$img"
-done
+if [[ "$HAVE_IMAGES" == true ]]; then
+  for img in "${IMAGES[@]}"; do
+    check_image_config "$img"
+  done
+fi
 
 # =============================================================================
 # SECTION 3 — DOCKER COMPOSE INSPECT (Setup A and B only)
@@ -423,7 +621,7 @@ fi
 ROWS_TSV="$REPORT_DIR/.rows.tsv"
 : > "$ROWS_TSV"
 
-if [[ "$SETUP" != "C" ]]; then
+if [[ "$SETUP" != "C" && "$HAVE_IMAGES" == true ]]; then
   log_section "Trivy Vulnerability Scan"
 
   # Refresh the DB once, before the parallel workers start (avoids download races)
@@ -539,7 +737,7 @@ fi
 # =============================================================================
 # SECTION 5 — ECR SCAN (Setup C, D)
 # =============================================================================
-if [[ "$SETUP" == "C" || "$SETUP" == "D" ]]; then
+if [[ "$HAVE_IMAGES" == true && ( "$SETUP" == "C" || "$SETUP" == "D" ) ]]; then
   log_section "ECR Scan Results"
   CFG_FAILS=0
   IMAGE="${IMAGES[0]}"
@@ -665,6 +863,40 @@ if [[ "$SETUP" != "C" && -s "$ROWS_TSV" ]]; then
 fi
 rm -f "$ROWS_TSV"
 
+# -----------------------------------------------------------------------------
+# Semgrep summary: "semgrep" array in summary.json, section in summary.md, and a
+# separate semgrep-summary.csv (its columns differ from the per-image summary.csv)
+# -----------------------------------------------------------------------------
+if [[ ${#SEMGREP_PATHS[@]} -gt 0 ]]; then
+  SG_ARR=$(jq -s 'map(del(.findings[20:]))' "$SG_ITEMS")   # top 20 per path; full list in <report-dir>/semgrep/*.json
+  if [[ -s "$REPORT_DIR/summary.json" ]]; then
+    jq --argjson sg "$SG_ARR" '. + { semgrep: $sg }' "$REPORT_DIR/summary.json" > "$REPORT_DIR/summary.json.tmp" \
+      && mv "$REPORT_DIR/summary.json.tmp" "$REPORT_DIR/summary.json"
+  else
+    jq -n --arg ts "$TIMESTAMP" --arg setup "$SETUP" --argjson sg "$SG_ARR" \
+      '{ generated: $ts, setup: $setup, images: [], semgrep: $sg }' > "$REPORT_DIR/summary.json"
+  fi
+  {
+    echo "path,engine,status,files_scanned,error,warning,info,gate_severity,gate_findings,scan_errors"
+    jq -r '.[] | [.path, .engine, .status, .files_scanned, .counts.error, .counts.warning, .counts.info,
+                  .gate_severity, .gate_findings, (.scan_errors | length)] | @csv' <<<"$SG_ARR"
+  } > "$REPORT_DIR/semgrep-summary.csv"
+  [[ -s "$REPORT_DIR/summary.md" ]] || {
+    echo "# Docker Security Scan Summary"; echo
+    echo "Generated: $TIMESTAMP  |  Setup: $SETUP  |  Images: ${#IMAGES[@]}"
+  } > "$REPORT_DIR/summary.md"
+  {
+    echo; echo "## Semgrep (static analysis)"; echo
+    echo "| Path | Engine | Files scanned | Error | Warning | Info | Gate (>=) | Gate findings | Status |"
+    echo "|---|---|---:|---:|---:|---:|---|---:|---|"
+    jq -r '.[] | "| \(.path) | \(.engine) | \(.files_scanned) | \(.counts.error) | \(.counts.warning) | \(.counts.info) | \(.gate_severity) | \(.gate_findings) | \(.status) |"' <<<"$SG_ARR"
+    while IFS= read -r item; do
+      echo; echo '```text'; render_semgrep "$item" 20; echo '```'
+    done < <(jq -c '.[]' <<<"$SG_ARR")
+  } >> "$REPORT_DIR/summary.md"
+  log_info "Semgrep totals: $SG_FINDINGS finding(s) in ${#SEMGREP_PATHS[@]} path(s); see $REPORT_DIR/semgrep-summary.csv and the semgrep section of summary.json/md"
+fi
+
 # =============================================================================
 # REMEDIATION — what to upgrade, per image (reads the Trivy JSON already written)
 # =============================================================================
@@ -725,7 +957,7 @@ render_remediation() {
     (.base_image_advice[] | "      - \(.)")' <<<"$1"
 }
 
-if [[ "$REMEDIATION" == true && "$SETUP" != "C" ]]; then
+if [[ "$REMEDIATION" == true && "$SETUP" != "C" && "$HAVE_IMAGES" == true ]]; then
   log_section "Remediation"
   REM_ITEMS=()
   for img in "${IMAGES[@]}"; do
@@ -751,6 +983,13 @@ if [[ "$REMEDIATION" == true && "$SETUP" != "C" ]]; then
     fi
     log_info "Remediation details: $REPORT_DIR/remediation.json"
   fi
+fi
+
+if [[ "$REMEDIATION" == true && ${#SEMGREP_PATHS[@]} -gt 0 && $SG_FINDINGS -gt 0 ]]; then
+  SG_ADVICE="Semgrep: fix the flagged code and run Semgrep before docker build. Suppress a false positive with '# nosemgrep: <rule-id>' plus a comment explaining why."
+  log_section "Semgrep advice"
+  log_info "$SG_ADVICE"
+  [[ -f "$REPORT_DIR/summary.md" ]] && printf '\n%s\n' "$SG_ADVICE" >> "$REPORT_DIR/summary.md"
 fi
 
 log ""

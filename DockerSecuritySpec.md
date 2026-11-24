@@ -370,6 +370,86 @@ fi
 
 ---
 
+## 11b. Static Code Analysis (Semgrep)
+
+### Purpose
+
+Semgrep is an open-source SAST tool. It analyses your **own source code and Dockerfiles** for flaws (command injection, `eval`, hardcoded passwords, insecure `ADD http://`, missing `USER`). Trivy (section 11) covers the **dependencies and OS packages** inside the image. Both are needed. Run Semgrep **before** `docker build`.
+
+Recommended pipeline order for every setup:
+
+`semgrep` → `docker build` → Trivy / image checks → runtime checks
+
+| Setup | Where to run Semgrep |
+|---|---|
+| **A** | Manually on the source before each `docker build` (`./docker-scan.sh --setup A --semgrep ./src`) |
+| **B** | First pipeline job, before the build job; the build job needs it to pass (`--exit-on-fail`) |
+| **C** | Manually on the source before building and pushing to ECR |
+| **D** | First pipeline job, before the build and push to ECR; the push needs it to pass (`--exit-on-fail`) |
+
+### Options (`docker-scan.sh`)
+
+| Option | Description |
+|---|---|
+| `--semgrep <path>` | Scan a source directory or file (repeatable). Works alone: no `--image` is needed |
+| `--semgrep-config <cfg>` | Rules to use (repeatable, default `auto`) |
+| `--semgrep-severity <ERROR\|WARNING\|INFO>` | Minimum severity to report and to fail on (default: report `INFO` and above, fail on `ERROR`) |
+
+The script always runs Semgrep with `--metrics off`. Paths `node_modules`, `.git`, `venv`, `.venv`, `dist`, `build`, `__pycache__` and `vendor` are always excluded.
+
+Suggested rule packs:
+
+| Pack | Use |
+|---|---|
+| `auto` | Registry rules chosen for the project (default) |
+| `p/owasp-top-ten` | OWASP Top 10 issues |
+| `p/python`, `p/javascript`, ... | Language rules |
+| `p/dockerfile`, `p/docker` | Dockerfile and compose issues |
+| a local file or directory | Your own rules, works offline |
+
+> `--config auto` and `p/...` packs download rules from the Semgrep registry, so they need network access. Local rule files work offline.
+
+### Severity gate
+
+| Situation | Result |
+|---|---|
+| Findings below the gate severity | Reported, no failure |
+| Finding at `ERROR` (or at/above `--semgrep-severity`) | `RESULT: FAILED`; exit code `1` with `--exit-on-fail` |
+| Semgrep missing, unreadable path, or Semgrep crash | Exit code `2` (never hidden) |
+
+Semgrep scan errors (for example a file that cannot be parsed) are shown as warnings. Findings alone are not a tool error.
+
+### Reports
+
+Written in `<report-dir>`:
+
+| File | Content |
+|---|---|
+| `semgrep/<path>.json` | Full Semgrep JSON report (all findings) |
+| `semgrep/<path>.txt` | Findings grouped by `ERROR`, `WARNING`, `INFO` |
+| `scan-report.txt` / `--output` | Semgrep section with the top 20 findings per severity and path (rule, `file:line`, message) |
+| `summary.json` | `semgrep` array: `path`, `engine`, `configs`, `files_scanned`, `scan_errors`, `counts`, `gate_severity`, `gate_findings`, `status`, `findings` (top 20) |
+| `summary.md` | Semgrep section |
+| `semgrep-summary.csv` | One row per path (separate file, its columns differ from `summary.csv`) |
+
+### Install
+
+- `pipx install semgrep` or `pip install semgrep`
+- Without the CLI, the script falls back to the `semgrep/semgrep` Docker image and mounts the path read-only. The output states when it does this.
+- Manual: `docker run --rm -v "$PWD:/src" semgrep/semgrep semgrep scan --config auto /src`
+
+### Ignoring files and false positives
+
+- Add a `.semgrepignore` file in the scanned path (same syntax as `.gitignore`).
+- Suppress one finding with `# nosemgrep: <rule-id>` on the flagged line, with a comment explaining why. Every suppression must be justified in code review.
+
+### Checklist
+
+- [ ] Semgrep runs before `docker build` (and in the pipeline for Setup B and D)
+- [ ] No `ERROR` findings (or all are suppressed with a justified `# nosemgrep`)
+- [ ] Dockerfiles are scanned with `p/dockerfile`
+
+---
 ## Checklist
 
 Use this checklist when adding or modifying any container. Mark N/A for items that do not apply to your setup.
