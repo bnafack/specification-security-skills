@@ -21,6 +21,9 @@
 #   --force                        Ignore cached results, rescan every image
 #   --skip-db-update               Do not refresh the Trivy vulnerability DB
 #   --secrets                      Also run Trivy secret scanning (much slower)
+#   --no-remediation               Skip the remediation section (fixable packages, base image
+#                                  advice). Default: on; it only reads the Trivy JSON already
+#                                  written, so it is cheap. Also writes <report-dir>/remediation.json
 #   --exit-on-fail                 Exit 1 on CRITICAL/HIGH or failed checks
 #   --region      <aws-region>     Required for Setup C and D
 #   --repo        <ecr-repo-name>  Required for Setup C and D (single image only)
@@ -35,6 +38,68 @@
 #   ./docker-scan.sh --setup C --image 123456789.dkr.ecr.eu-west-1.amazonaws.com/myrepo:1.0.0 --region eu-west-1 --repo myrepo --exit-on-fail
 #   ./docker-scan.sh --setup D --image 123456789.dkr.ecr.eu-west-1.amazonaws.com/myrepo:1.0.0 --region eu-west-1 --repo myrepo --profile myprofile --output report.txt --exit-on-fail
 #   ./docker-scan.sh --setup A --image myapp:1.0.0 --compose docker-compose.yml --output report.txt
+#
+# More examples (one per kind of check):
+#
+#   # 1. Full scan of every local image, with a text copy and a report folder
+#   #    (what was run in this session; results in report/ and test.txt)
+#   ./docker-scan.sh --setup A --all --output test.txt --report-dir report
+#
+#   # 2. Scan one image: vulnerabilities by severity + package count
+#   #    (e.g. postgres:18.1 -> CRITICAL/HIGH/MEDIUM/LOW/UNKNOWN + packages)
+#   ./docker-scan.sh --setup A --image postgres:18.1 --report-dir report-pg
+#
+#   # 3. Scan several chosen images at once
+#   ./docker-scan.sh --setup A --image redis:7-alpine --image caddy:2.10.2-alpine --image python:3.13-slim
+#
+#   # 4. Scan a list of images from a file (one per line, # comments allowed)
+#   printf '%s\n' '# my images' postgres:16 redis:7-alpine > images.txt
+#   ./docker-scan.sh --setup A --images-file images.txt
+#
+#   # 5. Image config checks only matter per image: user (root or not),
+#   #    exposed ports, secrets in ENV var names. They run for every image.
+#   ./docker-scan.sh --setup A --image ml-backend:latest
+#
+#   # 6. Runtime hardening checks (read-only rootfs, privileged, no-new-privileges,
+#   #    cap_add/cap_drop, network mode, memory/CPU limits, container user).
+#   #    They run on a RUNNING container of the image; start one first:
+#   docker run -d --name test-redis redis:7-alpine
+#   ./docker-scan.sh --setup A --image redis:7-alpine
+#   docker rm -f test-redis
+#
+#   # 7. Add docker-compose checks (Setup A/B)
+#   ./docker-scan.sh --setup A --image myapp:1.0.0 --compose docker-compose.yml
+#
+#   # 8. Faster reruns: reuse cached results, offline DB, more parallel jobs
+#   ./docker-scan.sh --setup A --all --skip-db-update --jobs 8
+#
+#   # 9. Ignore the cache and rescan everything from scratch
+#   ./docker-scan.sh --setup A --all --force
+#
+#   # 10. Also look for secrets inside image files (much slower)
+#   ./docker-scan.sh --setup A --image myapp:1.0.0 --secrets
+#
+#   # 11. CI gate: exit code 1 on CRITICAL/HIGH or failed checks
+#   ./docker-scan.sh --setup B --image myapp:1.0.0 --exit-on-fail; echo "exit=$?"
+#
+#   # 12. Read the results afterwards
+#   cat report/summary.md                       # summary table
+#   column -s, -t < report/summary.csv | less -S # same data as CSV
+#   jq . report/summary.json                    # machine-readable
+#   ls report/images/                           # per-image Trivy JSON/table files
+#   jq '[.Results[]?.Packages[]?] | length' report/images/postgres_18.1.json  # package count
+#
+#   # 13. Remediation: which packages to upgrade (OS vs application), to which version,
+#   #     plus unfixable findings and base image advice. Shown at the end of the scan,
+#   #     in scan-report.txt, summary.md and report/remediation.json (disable: --no-remediation)
+#   ./docker-scan.sh --setup A --image postgres:16 --report-dir report
+#   jq '.images[] | {image, os_fixes: (.os_packages|length), app_fixes: (.app_dependencies|length), unfixable}' report/remediation.json
+#
+#   # 14. List fixable CRITICAL/HIGH findings of one image with jq (package, installed -> fixed)
+#   jq -r '.Results[]?.Vulnerabilities[]? | select(.Severity=="CRITICAL" or .Severity=="HIGH") | select(.FixedVersion!=null) | "\(.Severity) \(.PkgName) \(.InstalledVersion) -> \(.FixedVersion)"' report/images/postgres_16.json | sort -u
+#
+#   # 15. Show this help
+#   ./docker-scan.sh --help
 # =============================================================================
 
 set -Eeuo pipefail
@@ -64,6 +129,7 @@ FORCE=false
 SKIP_DB_UPDATE=false
 SCAN_SECRETS=false
 EXIT_ON_FAIL=false
+REMEDIATION=true
 AWS_REGION=""
 ECR_REPO=""
 AWS_PROFILE=""
@@ -92,11 +158,13 @@ while [[ $# -gt 0 ]]; do
     --force)          FORCE=true;                       shift ;;
     --skip-db-update) SKIP_DB_UPDATE=true;              shift ;;
     --secrets)        SCAN_SECRETS=true;                shift ;;
+    --no-remediation) REMEDIATION=false;                shift ;;
+    --remediation)    REMEDIATION=true;                 shift ;;
     --exit-on-fail)   EXIT_ON_FAIL=true;                shift ;;
     --region)         need_arg "$@"; AWS_REGION="$2";   shift 2 ;;
     --repo)           need_arg "$@"; ECR_REPO="$2";     shift 2 ;;
     --profile)        need_arg "$@"; AWS_PROFILE="$2";  shift 2 ;;
-    -h|--help)        sed -n '2,38p' "$0"; exit 0 ;;
+    -h|--help)        sed -n '2,/^set -E/{/^set -E/!p}' "$0"; exit 0 ;;
     *) die "Unknown argument: $1" ;;
   esac
 done
@@ -190,6 +258,20 @@ log "Report dir: $REPORT_DIR"
 [[ -n "$AWS_PROFILE"  ]] && log "Profile:    $AWS_PROFILE"
 
 SECRET_PATTERNS='PASSWORD|SECRET|TOKEN|KEY|CREDENTIAL|PRIVATE'
+
+# Env var names that match SECRET_PATTERNS but are public identifiers, not secrets:
+# GPG_KEY (public key ID in python/postgres bases), *_KEY_ID and *PUBLIC_KEY, unless the
+# name also contains a strong secret word (PASSWORD, SECRET, TOKEN, PRIVATE, CREDENTIAL).
+filter_secret_env() {
+  local name up
+  while IFS= read -r name; do
+    [[ -n "$name" ]] || continue
+    up="${name^^}"
+    if [[ "$up" == "GPG_KEY" ]]; then continue; fi
+    if [[ "$up" =~ (_KEY_ID|PUBLIC_KEY)$ && ! "$up" =~ PASSWORD|SECRET|TOKEN|PRIVATE|CREDENTIAL ]]; then continue; fi
+    printf '%s\n' "$name"
+  done
+}
 safe_name() { printf '%s' "${1//[^A-Za-z0-9._-]/_}"; }
 
 # =============================================================================
@@ -227,7 +309,7 @@ check_image_config() {
   fi
 
   # Only variable NAMES are inspected so secret values never reach the report
-  envnames=$(docker image inspect -f '{{range .Config.Env}}{{println .}}{{end}}' "$img" | cut -d= -f1 | grep -Ei "$SECRET_PATTERNS" || true)
+  envnames=$(docker image inspect -f '{{range .Config.Env}}{{println .}}{{end}}' "$img" | cut -d= -f1 | grep -Ei "$SECRET_PATTERNS" | filter_secret_env || true)
   if [[ -n "$envnames" ]]; then
     log_fail "Potential secret in image ENV vars (names): $(echo "$envnames" | paste -sd, -)"
   else
@@ -576,6 +658,93 @@ if [[ "$SETUP" != "C" && -s "$ROWS_TSV" ]]; then
   rm -f "$ROWS_TSV" "$RESULTS_TSV"
 fi
 rm -f "$ROWS_TSV"
+
+# =============================================================================
+# REMEDIATION — what to upgrade, per image (reads the Trivy JSON already written)
+# =============================================================================
+# jq: highest version among comma-separated FixedVersion lists (heuristic: numeric-aware key)
+REM_JQ='
+def vkey: [scan("[0-9]+|[A-Za-z]+") | (tonumber? // .)];
+def fixes($cls):
+  [ .Results[]? | select(.Class == $cls) | . as $r | (.Vulnerabilities // [])[]
+    | select(.Severity == "CRITICAL" or .Severity == "HIGH")
+    | select((.FixedVersion // "") != "")
+    | { target: $r.Target, type: $r.Type, pkg: .PkgName, installed: .InstalledVersion,
+        fixed: .FixedVersion, sev: .Severity, id: .VulnerabilityID } ]
+  | group_by([.target, .pkg, .installed])
+  | map({ package: .[0].pkg, installed: .[0].installed,
+          fixed: ([.[].fixed | split(", ")[]] | max_by(vkey)),
+          cves: ([.[].id] | unique | length),
+          severity: (if any(.[]; .sev == "CRITICAL") then "CRITICAL" else "HIGH" end),
+          target: .[0].target, type: .[0].type })
+  | sort_by([(if .severity == "CRITICAL" then 0 else 1 end), .package]);
+{ image: $img,
+  os: (if .Metadata.OS.Family then "\(.Metadata.OS.Family) \(.Metadata.OS.Name)" else null end),
+  os_packages: (fixes("os-pkgs") | map(del(.target, .type))),
+  app_dependencies: fixes("lang-pkgs"),
+  unfixable: ([.Results[]? | (.Vulnerabilities // [])[]
+               | select(.Severity == "CRITICAL" or .Severity == "HIGH")
+               | select((.FixedVersion // "") == "")] | length),
+  base_image_advice: $advice }'
+
+# base_advice <image> <os-family>: concise heuristic bullets (no network calls), one per line
+base_advice() {
+  local img="$1" fam="$2" name tag repo
+  name="${img##*/}"; repo="${name%%:*}"
+  tag=""; [[ "$name" == *:* ]] && tag="${name#*:}"
+  if [[ "$fam" == "debian" || "$fam" == "ubuntu" ]] \
+     && [[ " postgres python node redis nginx httpd php ruby golang memcached rabbitmq haproxy " == *" $repo "* ]] \
+     && [[ "$tag" != *alpine* && "$tag" != *slim* ]]; then
+    printf '%s\n' "Image is $fam-based: try the ${repo}:<version>-alpine or -slim tag (fewer packages, fewer CVEs); test your app first"
+  fi
+  printf '%s\n' "Rebuild with: docker build --pull --no-cache -t $img . (picks up patched base layers)"
+  printf '%s\n' "Use a multi-stage build: compile in a builder stage, ship only the runtime in the final stage"
+  printf '%s\n' "Add a non-root USER and pin dependencies with a lockfile (requirements.txt hashes, package-lock.json)"
+}
+
+# render_remediation <remediation-object-json>: plain text, capped lists (full data in remediation.json)
+render_remediation() {
+  jq -r --argjson max 15 '
+    def cut($a): ($a[:$max][]), (if ($a|length) > $max then "    ... \(($a|length) - $max) more (see remediation.json)" else empty end);
+    "  \(.image)  (\(.os // "OS unknown"))",
+    "    a) OS package fixes (CRITICAL/HIGH with a fix): \(.os_packages|length)",
+    cut(.os_packages | map("      [\(.severity)] \(.package) \(.installed) -> \(.fixed)  (\(.cves) CVE)")),
+    (if (.os_packages|length) > 0 then "      => update/rebuild the base image, or: apt-get update && apt-get install --only-upgrade <pkg> (apk upgrade <pkg>)" else empty end),
+    "    b) Application dependency fixes: \(.app_dependencies|length)",
+    cut(.app_dependencies | map("      [\(.severity)] \(.package) \(.installed) -> \(.fixed)  (\(.cves) CVE; \(.type // "?"): \(.target))")),
+    (if (.app_dependencies|length) > 0 then "      => bump these in the manifest/lockfile named above, then rebuild" else empty end),
+    "    c) Unfixable CRITICAL/HIGH (no fixed version yet): \(.unfixable)",
+    (if .unfixable > 0 then "      => change base image, remove the package, check reachability, or record an accepted risk in .trivyignore" else empty end),
+    "    Base image advice:",
+    (.base_image_advice[] | "      - \(.)")' <<<"$1"
+}
+
+if [[ "$REMEDIATION" == true && "$SETUP" != "C" ]]; then
+  log_section "Remediation"
+  REM_ITEMS=()
+  for img in "${IMAGES[@]}"; do
+    safe=$(safe_name "$img")
+    [[ "${IMG_PRESENT[$img]}" == true && -s "$RAW_DIR/$safe.json" ]] || continue
+    fam=$(jq -r '.Metadata.OS.Family // ""' "$RAW_DIR/$safe.json")
+    advice=$(base_advice "$img" "$fam" | jq -R . | jq -s .)
+    item=$(jq --arg img "$img" --argjson advice "$advice" "$REM_JQ" "$RAW_DIR/$safe.json") \
+      || { log_warn "Could not build remediation for $img"; continue; }
+    REM_ITEMS+=("$item")
+    while IFS= read -r l; do log "$l"; done < <(render_remediation "$item")
+  done
+  if (( ${#REM_ITEMS[@]} > 0 )); then
+    printf '%s\n' "${REM_ITEMS[@]}" | jq -s --arg ts "$TIMESTAMP" '{ generated: $ts, images: . }' > "$REPORT_DIR/remediation.json"
+    if [[ -f "$REPORT_DIR/summary.md" ]]; then
+      {
+        echo; echo "## Remediation"
+        for item in "${REM_ITEMS[@]}"; do
+          echo; echo '```text'; render_remediation "$item"; echo '```'
+        done
+      } >> "$REPORT_DIR/summary.md"
+    fi
+    log_info "Remediation details: $REPORT_DIR/remediation.json"
+  fi
+fi
 
 log ""
 if (( SCAN_ERRORS > 0 )); then
