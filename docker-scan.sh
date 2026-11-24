@@ -21,9 +21,13 @@
 #   --force                        Ignore cached results, rescan every image
 #   --skip-db-update               Do not refresh the Trivy vulnerability DB
 #   --secrets                      Also run Trivy secret scanning (much slower)
-#   --no-remediation               Skip the remediation section (fixable packages, base image
+#   --remediation                  Show the remediation section (fixable packages, base image
 #                                  advice). Default: on; it only reads the Trivy JSON already
-#                                  written, so it is cheap. Also writes <report-dir>/remediation.json
+#                                  written, so it is cheap. Writes <report-dir>/remediation.json
+#                                  (all images) and <report-dir>/images/<image>.remediation.json
+#                                  ("highest fixed version" is a numeric-aware heuristic, not a
+#                                  dpkg/apk/semver comparison: check the Trivy JSON when in doubt)
+#   --no-remediation               Skip the remediation section
 #   --exit-on-fail                 Exit 1 on CRITICAL/HIGH or failed checks
 #   --region      <aws-region>     Required for Setup C and D
 #   --repo        <ecr-repo-name>  Required for Setup C and D (single image only)
@@ -91,9 +95,11 @@
 #
 #   # 13. Remediation: which packages to upgrade (OS vs application), to which version,
 #   #     plus unfixable findings and base image advice. Shown at the end of the scan,
-#   #     in scan-report.txt, summary.md and report/remediation.json (disable: --no-remediation)
+#   #     in scan-report.txt, summary.md, report/remediation.json and one
+#   #     report/images/<image>.remediation.json per image (disable: --no-remediation)
 #   ./docker-scan.sh --setup A --image postgres:16 --report-dir report
 #   jq '.images[] | {image, os_fixes: (.os_packages|length), app_fixes: (.app_dependencies|length), unfixable}' report/remediation.json
+#   jq '{os_packages, app_dependencies, unfixable}' report/images/postgres_16.remediation.json
 #
 #   # 14. List fixable CRITICAL/HIGH findings of one image with jq (package, installed -> fixed)
 #   jq -r '.Results[]?.Vulnerabilities[]? | select(.Severity=="CRITICAL" or .Severity=="HIGH") | select(.FixedVersion!=null) | "\(.Severity) \(.PkgName) \(.InstalledVersion) -> \(.FixedVersion)"' report/images/postgres_16.json | sort -u
@@ -730,6 +736,7 @@ if [[ "$REMEDIATION" == true && "$SETUP" != "C" ]]; then
     item=$(jq --arg img "$img" --argjson advice "$advice" "$REM_JQ" "$RAW_DIR/$safe.json") \
       || { log_warn "Could not build remediation for $img"; continue; }
     REM_ITEMS+=("$item")
+    printf '%s\n' "$item" > "$RAW_DIR/$safe.remediation.json"
     while IFS= read -r l; do log "$l"; done < <(render_remediation "$item")
   done
   if (( ${#REM_ITEMS[@]} > 0 )); then
